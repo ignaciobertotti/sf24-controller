@@ -1,0 +1,204 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>SF-24 Controller</title>
+<style>
+  :root { color-scheme: dark; --bg: #111; --panel: #1d1d1d; --text: #f2f2f2; --muted: #a0a0a0; --accent: #dc0000; --ok: #3ecf6e; }
+  * { box-sizing: border-box; }
+  body { margin: 0; padding: 16px; min-height: 100vh; background: var(--bg); color: var(--text); font: 16px/1.4 system-ui, sans-serif; }
+  main { max-width: 420px; margin: 0 auto; }
+  h1 { font-size: 24px; margin: 8px 0 16px; }
+  button { width: 100%; padding: 16px; border: 0; border-radius: 8px; background: var(--accent); color: #fff; font: inherit; font-weight: 600; }
+  button:disabled { opacity: .45; }
+  .status { margin: 16px 0; padding: 12px 16px; border-radius: 8px; background: var(--panel); }
+  .row { display: flex; justify-content: space-between; padding: 4px 0; }
+  .row span:last-child { font-weight: 600; }
+  .on { color: var(--ok); }
+  .lamps { display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; margin-bottom: 16px; }
+  .lamp { padding: 12px 4px; border-radius: 8px; background: var(--panel); color: var(--muted); text-align: center; font-size: 14px; }
+  .lamp.active { background: var(--accent); color: #fff; }
+  .help { color: var(--muted); font-size: 14px; }
+  .error { color: #ff8a80; }
+</style>
+</head>
+<body>
+<main>
+  <h1>SF-24 Controller</h1>
+  <button id="connect">Connect car</button>
+  <div class="status">
+    <div class="row"><span>Car</span><span id="car">Not connected</span></div>
+    <div class="row"><span>Controller</span><span id="pad">Press any button</span></div>
+    <div class="row"><span>Battery</span><span id="battery">-</span></div>
+  </div>
+  <div class="lamps">
+    <div class="lamp" id="forward">Forward</div>
+    <div class="lamp" id="reverse">Reverse</div>
+    <div class="lamp" id="turbo">Turbo</div>
+    <div class="lamp" id="left">Left</div>
+    <div class="lamp" id="right">Right</div>
+    <div class="lamp" id="donut">Donut</div>
+  </div>
+  <p class="help">RT forward, LT reverse, left stick steer. A turbo, X donut, Y lights. B or Back stops and disconnects. Close the Shell app first, and keep this page open while driving.</p>
+  <p class="error" id="error"></p>
+</main>
+<script>
+  const SERVICE = 0xfff0;
+  const CONTROL = 0xfff1;
+  const BATTERY_SERVICE = 0x180f;
+  const BATTERY_LEVEL = 0x2a19;
+  const SEND_INTERVAL = 50;
+  const TRIGGER_THRESHOLD = 0.2;
+  const STEER_THRESHOLD = 0.4;
+  const STOP_PACKET = new Uint8Array([1, 0, 0, 0, 0, 0, 0, 0]);
+  const BUTTON = { a: 0, b: 1, x: 2, y: 3, back: 8 };
+
+  const el = (id) => document.getElementById(id);
+  let device = null;
+  let control = null;
+  let busy = false;
+  let wakeLock = null;
+  const toggles = { a: false, x: false, y: false };
+  const wasDown = { a: false, x: false, y: false };
+
+  function showError(message) { el("error").textContent = message; }
+
+  function currentPad() {
+    return [...navigator.getGamepads()].find((pad) => pad && pad.connected) || null;
+  }
+
+  function pressed(pad, name) {
+    const button = pad.buttons[BUTTON[name]];
+    return Boolean(button && button.pressed);
+  }
+
+  function buildPacket(pad) {
+    const rt = pad.buttons[7] ? pad.buttons[7].value : 0;
+    const lt = pad.buttons[6] ? pad.buttons[6].value : 0;
+    const forward = rt > TRIGGER_THRESHOLD;
+    const reverse = lt > TRIGGER_THRESHOLD;
+    const steer = pad.axes[0] || 0;
+    return new Uint8Array([
+      1,
+      forward && !reverse ? 1 : 0,
+      reverse && !forward ? 1 : 0,
+      steer < -STEER_THRESHOLD ? 1 : 0,
+      steer > STEER_THRESHOLD ? 1 : 0,
+      toggles.y ? 1 : 0,
+      toggles.a ? 1 : 0,
+      toggles.x ? 1 : 0,
+    ]);
+  }
+
+  function showPacket(packet) {
+    ["forward", "reverse", "left", "right"].forEach((id, index) => {
+      el(id).classList.toggle("active", packet[index + 1] === 1);
+    });
+    el("turbo").classList.toggle("active", packet[6] === 1);
+    el("donut").classList.toggle("active", packet[7] === 1);
+  }
+
+  async function write(packet) {
+    if (!control || busy) return;
+    busy = true;
+    try {
+      await control.writeValueWithoutResponse(packet);
+    } catch (error) {
+      showError(error.message);
+    } finally {
+      busy = false;
+    }
+  }
+
+  async function sendStop() {
+    if (!control) return;
+    while (busy) await new Promise((resolve) => setTimeout(resolve, 5));
+    await write(STOP_PACKET);
+    showPacket(STOP_PACKET);
+  }
+
+  async function disconnect() {
+    toggles.a = toggles.x = toggles.y = false;
+    await sendStop();
+    control = null;
+    if (device && device.gatt.connected) device.gatt.disconnect();
+  }
+
+  function onDisconnected() {
+    control = null;
+    showPacket(STOP_PACKET);
+    el("car").textContent = "Not connected";
+    el("car").classList.remove("on");
+    el("connect").disabled = false;
+    if (wakeLock) wakeLock.release();
+    wakeLock = null;
+  }
+
+  async function connect() {
+    showError("");
+    if (!navigator.bluetooth) {
+      showError("This browser has no Web Bluetooth. Use Chrome on Android.");
+      return;
+    }
+    try {
+      device = await navigator.bluetooth.requestDevice({
+        filters: [{ namePrefix: "SL-" }],
+        optionalServices: [SERVICE, BATTERY_SERVICE],
+      });
+      device.addEventListener("gattserverdisconnected", onDisconnected);
+      el("car").textContent = "Connecting...";
+      const server = await device.gatt.connect();
+      const service = await server.getPrimaryService(SERVICE);
+      control = await service.getCharacteristic(CONTROL);
+      el("car").textContent = device.name;
+      el("car").classList.add("on");
+      el("connect").disabled = true;
+      await readBattery(server);
+      if (navigator.wakeLock) wakeLock = await navigator.wakeLock.request("screen");
+    } catch (error) {
+      el("car").textContent = "Not connected";
+      showError(error.message);
+    }
+  }
+
+  async function readBattery(server) {
+    try {
+      const service = await server.getPrimaryService(BATTERY_SERVICE);
+      const level = await service.getCharacteristic(BATTERY_LEVEL);
+      const value = await level.readValue();
+      el("battery").textContent = value.getUint8(0) + "%";
+    } catch (error) {
+      el("battery").textContent = "Unknown";
+    }
+  }
+
+  function tick() {
+    const pad = currentPad();
+    el("pad").textContent = pad ? "Connected" : "Press any button";
+    el("pad").classList.toggle("on", Boolean(pad));
+    if (!control) return;
+    if (!pad) { sendStop(); return; }
+
+    if (pressed(pad, "b") || pressed(pad, "back")) { disconnect(); return; }
+
+    for (const name of Object.keys(toggles)) {
+      const down = pressed(pad, name);
+      if (down && !wasDown[name]) toggles[name] = !toggles[name];
+      wasDown[name] = down;
+    }
+
+    const packet = buildPacket(pad);
+    write(packet);
+    showPacket(packet);
+  }
+
+  document.addEventListener("visibilitychange", () => {
+    if (document.hidden) sendStop();
+  });
+  window.addEventListener("gamepaddisconnected", sendStop);
+  el("connect").addEventListener("click", connect);
+  setInterval(tick, SEND_INTERVAL);
+</script>
+</body>
+</html>
